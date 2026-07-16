@@ -1,0 +1,9 @@
+scikit-fmm
+scikit-image
+matplotlib
+pillow
+numpy
+scipy
+ipykernel
+ipywidgets
+ipympl
