@@ -382,6 +382,25 @@
       color: rgba(42, 50, 58, 0.72);
       margin: -0.15rem 0 0.55rem;
     }
+
+    .mask-row {
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 0.45rem;
+      text-transform: none;
+      letter-spacing: 0;
+      font-size: 0.74rem;
+      cursor: pointer;
+    }
+    .mask-swatch {
+      width: 0.85rem;
+      height: 0.85rem;
+      border-radius: 2px;
+      border: 1px solid rgba(18, 22, 26, 0.28);
+      flex: 0 0 auto;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.35);
+    }
     #inputCanvas.is-placing {
       cursor: crosshair;
     }
@@ -557,9 +576,19 @@
           </select>
         </div>
 
+        <div class="field" id="maskField" hidden>
+          <label class="mask-row" for="useMask">
+            <input type="checkbox" id="useMask" checked />
+            use exclude mask
+            <span class="mask-swatch" id="maskSwatch" title="Detected exclude color"></span>
+          </label>
+          <p class="field-hint" id="maskHint">B&amp;W image with one accent color — that color is excluded from the wave.</p>
+        </div>
+
         <div class="checks">
-          <label><input type="checkbox" id="invert" /> invert speed (dark = fast)</label>
+          <label><input type="checkbox" id="invert" /> invert image</label>
           <label><input type="checkbox" id="overlay" /> ghost original under lines</label>
+          <label><input type="checkbox" id="liveRender" /> live rendering</label>
           <label><input type="checkbox" id="autoRun" checked /> re-run when controls change</label>
         </div>
       </aside>
@@ -604,6 +633,10 @@
     $("viewT"),
   ];
 
+  const maskField = $("maskField");
+  const maskSwatch = $("maskSwatch");
+  const maskHint = $("maskHint");
+
   const controls = {
     blur: $("blur"),
     eps: $("eps"),
@@ -614,8 +647,10 @@
     pointSource: $("pointSource"),
     nScatter: $("nScatter"),
     edgeSide: $("edgeSide"),
+    useMask: $("useMask"),
     invert: $("invert"),
     overlay: $("overlay"),
+    liveRender: $("liveRender"),
     autoRun: $("autoRun"),
   };
 
@@ -632,9 +667,14 @@
   let sourceW = 0;
   let sourceH = 0;
   let sourceUrl = null; // e.g. "examples/einstein.jpg" when loaded from sample
+  /** @type {Uint8Array|null} 1 = excluded */
+  let sourceMask = null;
+  /** @type {[number, number, number]|null} RGB 0–255 */
+  let sourceMaskColor = null;
   let lastSVG = "";
   let running = false;
   let rerunTimer = 0;
+  let liveToken = 0; // bump to cancel in-flight live animation
   let scatterSeed = 0; // RNG seed for random points
   /** @type {Array<[number, number]>} fractional [fy, fx] in [0,1] */
   let customSeedsFrac = [];
@@ -739,6 +779,21 @@
     }
   }
 
+  function syncMaskUI() {
+    const detected = !!(sourceMask && sourceMaskColor);
+    maskField.hidden = !detected;
+    if (!detected) return;
+    const [r, g, b] = sourceMaskColor;
+    maskSwatch.style.background = `rgb(${r}, ${g}, ${b})`;
+    const pct = ((sourceMask.reduce((a, v) => a + v, 0) / sourceMask.length) * 100).toFixed(1);
+    maskHint.textContent = `Detected exclude color · ${pct}% of pixels`;
+  }
+
+  /** Active exclude mask, or null when unused. */
+  function activeMask() {
+    return sourceMask && controls.useMask.checked ? sourceMask : null;
+  }
+
   function syncLabels() {
     labels.blur.textContent = Number(controls.blur.value).toFixed(2);
     labels.eps.textContent = Number(controls.eps.value).toFixed(2);
@@ -765,9 +820,16 @@
     };
   }
 
-  // Separable Gaussian blur on Float32 grayscale [0,1]
-  function gaussianBlur(src, w, h, sigma) {
-    if (sigma <= 0) return src.slice();
+  // Separable Gaussian blur on Float32 grayscale [0,1].
+  // When mask is set, only unmasked pixels contribute / receive blur (mask is subtracted first).
+  function gaussianBlur(src, w, h, sigma, mask = null) {
+    if (sigma <= 0) {
+      const copy = src.slice();
+      if (mask) {
+        for (let i = 0; i < copy.length; i++) if (mask[i]) copy[i] = 0;
+      }
+      return copy;
+    }
     const radius = Math.max(1, Math.ceil(sigma * 3));
     const kernel = new Float32Array(radius * 2 + 1);
     const s2 = 2 * sigma * sigma;
@@ -784,41 +846,69 @@
 
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
+        const i = y * w + x;
+        if (mask && mask[i]) {
+          tmp[i] = 0;
+          continue;
+        }
         let acc = 0;
+        let wsum = 0;
         for (let k = -radius; k <= radius; k++) {
           const xx = Math.min(w - 1, Math.max(0, x + k));
-          acc += src[y * w + xx] * kernel[k + radius];
+          const j = y * w + xx;
+          if (mask && mask[j]) continue;
+          const kw = kernel[k + radius];
+          acc += src[j] * kw;
+          wsum += kw;
         }
-        tmp[y * w + x] = acc;
+        tmp[i] = wsum > 1e-12 ? acc / wsum : src[i];
       }
     }
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
+        const i = y * w + x;
+        if (mask && mask[i]) {
+          out[i] = 0;
+          continue;
+        }
         let acc = 0;
+        let wsum = 0;
         for (let k = -radius; k <= radius; k++) {
           const yy = Math.min(h - 1, Math.max(0, y + k));
-          acc += tmp[yy * w + x] * kernel[k + radius];
+          const j = yy * w + x;
+          if (mask && mask[j]) continue;
+          const kw = kernel[k + radius];
+          acc += tmp[j] * kw;
+          wsum += kw;
         }
-        out[y * w + x] = Math.min(1, Math.max(0, acc));
+        const v = wsum > 1e-12 ? acc / wsum : tmp[i];
+        out[i] = Math.min(1, Math.max(0, v));
       }
     }
     return out;
   }
 
-  function normalize(src) {
+  function normalize(src, mask = null) {
     let lo = Infinity, hi = -Infinity;
     for (let i = 0; i < src.length; i++) {
+      if (mask && mask[i]) continue;
       const v = src[i];
       if (v < lo) lo = v;
       if (v > hi) hi = v;
     }
     const out = new Float32Array(src.length);
     const span = hi - lo;
-    if (span <= 1e-12) {
+    if (!Number.isFinite(lo) || span <= 1e-12) {
       out.fill(0);
       return out;
     }
-    for (let i = 0; i < src.length; i++) out[i] = (src[i] - lo) / span;
+    for (let i = 0; i < src.length; i++) {
+      if (mask && mask[i]) {
+        out[i] = 0;
+        continue;
+      }
+      out[i] = (src[i] - lo) / span;
+    }
     return out;
   }
 
@@ -829,8 +919,37 @@
     ]);
   }
 
-  function makeSeeds(h, w, mode, nScatter) {
-    if (mode === "center") return [[(h / 2) | 0, (w / 2) | 0]];
+  function isMaskedAt(mask, y, x, w) {
+    return !!(mask && mask[y * w + x]);
+  }
+
+  /** BFS to nearest unmasked pixel; returns [y,x]. */
+  function nearestUnmasked(mask, h, w, y0, x0) {
+    if (!mask || !mask[y0 * w + x0]) return [y0, x0];
+    const N = w * h;
+    const seen = new Uint8Array(N);
+    const q = new Int32Array(N);
+    let head = 0, tail = 0;
+    const start = y0 * w + x0;
+    q[tail++] = start;
+    seen[start] = 1;
+    while (head < tail) {
+      const i = q[head++];
+      const x = i % w;
+      const y = (i / w) | 0;
+      if (!mask[i]) return [y, x];
+      if (x > 0 && !seen[i - 1]) { seen[i - 1] = 1; q[tail++] = i - 1; }
+      if (x + 1 < w && !seen[i + 1]) { seen[i + 1] = 1; q[tail++] = i + 1; }
+      if (y > 0 && !seen[i - w]) { seen[i - w] = 1; q[tail++] = i - w; }
+      if (y + 1 < h && !seen[i + w]) { seen[i + w] = 1; q[tail++] = i + w; }
+    }
+    return [y0, x0]; // fully masked — caller should handle
+  }
+
+  function makeSeeds(h, w, mode, nScatter, mask = null) {
+    if (mode === "center") {
+      return [nearestUnmasked(mask, h, w, (h / 2) | 0, (w / 2) | 0)];
+    }
 
     if (mode === "edge") {
       const side = controls.edgeSide.value;
@@ -838,27 +957,50 @@
       if (side === "left" || side === "right") {
         const step = Math.max(1, (h / 64) | 0);
         const x = side === "left" ? 0 : w - 1;
-        for (let y = 0; y < h; y += step) seeds.push([y, x]);
+        for (let y = 0; y < h; y += step) {
+          if (!isMaskedAt(mask, y, x, w)) seeds.push([y, x]);
+        }
+        if (seeds.length === 0) {
+          for (let y = 0; y < h; y += step) {
+            seeds.push(nearestUnmasked(mask, h, w, y, x));
+          }
+        }
       } else {
         const step = Math.max(1, (w / 64) | 0);
         const y = side === "top" ? 0 : h - 1;
-        for (let x = 0; x < w; x += step) seeds.push([y, x]);
+        for (let x = 0; x < w; x += step) {
+          if (!isMaskedAt(mask, y, x, w)) seeds.push([y, x]);
+        }
+        if (seeds.length === 0) {
+          for (let x = 0; x < w; x += step) {
+            seeds.push(nearestUnmasked(mask, h, w, y, x));
+          }
+        }
       }
       return seeds;
     }
 
     // points
     if (controls.pointSource.value === "custom") {
-      return fracToPixelSeeds(h, w);
+      return fracToPixelSeeds(h, w).filter(([y, x]) => !isMaskedAt(mask, y, x, w));
     }
 
     const rng = mulberry32(scatterSeed);
     const margin = Math.max(8, Math.min(h, w) >> 4);
     const seeds = [];
-    for (let i = 0; i < nScatter; i++) {
+    const maxTries = Math.max(200, nScatter * 80);
+    let tries = 0;
+    while (seeds.length < nScatter && tries < maxTries) {
+      tries++;
       const y = margin + ((rng() * (h - 2 * margin)) | 0);
       const x = margin + ((rng() * (w - 2 * margin)) | 0);
+      if (isMaskedAt(mask, y, x, w)) continue;
       seeds.push([y, x]);
+    }
+    while (seeds.length < nScatter) {
+      const y = margin + ((rng() * (h - 2 * margin)) | 0);
+      const x = margin + ((rng() * (w - 2 * margin)) | 0);
+      seeds.push(nearestUnmasked(mask, h, w, y, x));
     }
     return seeds;
   }
@@ -910,9 +1052,10 @@
 
   /**
    * First-order fast marching for |∇T| = 1/speed.
-   * Speeds must be > 0. Returns Float64Array travel times.
+   * Speeds must be > 0. Masked pixels (mask[i]===1) are never visited (T stays ∞).
+   * Returns Float64Array travel times.
    */
-  function travelTime(speed, w, h, seeds) {
+  function travelTime(speed, w, h, seeds, mask = null) {
     const N = w * h;
     const FAR = 0, TRIAL = 1, KNOWN = 2;
     const state = new Uint8Array(N);
@@ -948,6 +1091,7 @@
     }
 
     function consider(i) {
+      if (mask && mask[i]) return;
       if (state[i] === KNOWN) return;
       const t = solve(i);
       if (t < T[i]) {
@@ -960,12 +1104,14 @@
     for (const [sy, sx] of seeds) {
       if (sy < 0 || sy >= h || sx < 0 || sx >= w) continue;
       const i = sy * w + sx;
+      if (mask && mask[i]) continue;
       T[i] = 0;
       state[i] = KNOWN;
     }
     for (const [sy, sx] of seeds) {
       if (sy < 0 || sy >= h || sx < 0 || sx >= w) continue;
       const i = sy * w + sx;
+      if (mask && mask[i]) continue;
       if (sx > 0) consider(i - 1);
       if (sx + 1 < w) consider(i + 1);
       if (sy > 0) consider(i - w);
@@ -1042,10 +1188,23 @@
     const segments = [];
     for (let cy = 0; cy < h - 1; cy++) {
       for (let cx = 0; cx < w - 1; cx++) {
-        const tl = val(cy, cx) >= level ? 1 : 0;
-        const tr = val(cy, cx + 1) >= level ? 1 : 0;
-        const br = val(cy + 1, cx + 1) >= level ? 1 : 0;
-        const bl = val(cy + 1, cx) >= level ? 1 : 0;
+        const vtl = val(cy, cx);
+        const vtr = val(cy, cx + 1);
+        const vbr = val(cy + 1, cx + 1);
+        const vbl = val(cy + 1, cx);
+        // Skip cells touching excluded / unreached pixels so contours stay in the drawable domain.
+        if (
+          !Number.isFinite(vtl) ||
+          !Number.isFinite(vtr) ||
+          !Number.isFinite(vbr) ||
+          !Number.isFinite(vbl)
+        ) {
+          continue;
+        }
+        const tl = vtl >= level ? 1 : 0;
+        const tr = vtr >= level ? 1 : 0;
+        const br = vbr >= level ? 1 : 0;
+        const bl = vbl >= level ? 1 : 0;
         const idx = (tl) | (tr << 1) | (br << 2) | (bl << 3);
         const edges = CASES[idx];
         for (const [e0, e1] of edges) {
@@ -1111,16 +1270,24 @@
   }
 
   function extractContours(T, w, h, L) {
+    return extractContoursByLevel(T, w, h, L).all;
+  }
+
+  /** Contours grouped by increasing travel-time level (for live reveal). */
+  function extractContoursByLevel(T, w, h, L) {
     let tmax = 0;
     for (let i = 0; i < T.length; i++) {
       const v = T[i];
       if (Number.isFinite(v) && v > tmax) tmax = v;
     }
+    const levels = [];
     const all = [];
     for (let level = 0; level < tmax; level += L) {
-      all.push(...findContours(T, w, h, level));
+      const polys = findContours(T, w, h, level);
+      levels.push(polys);
+      all.push(...polys);
     }
-    return all;
+    return { levels, all, tmax };
   }
 
   // ── Drawing ────────────────────────────────────────────────────────
@@ -1131,11 +1298,19 @@
     }
   }
 
-  function drawGray(canvas, gray, w, h, seeds) {
+  function drawGray(canvas, gray, w, h, seeds, mask = null, maskColor = null) {
     resizeCanvas(canvas, w, h);
     const ctx = canvas.getContext("2d");
     const img = ctx.createImageData(w, h);
+    const showMask = !!(mask && maskColor && controls.useMask.checked);
     for (let i = 0; i < w * h; i++) {
+      if (showMask && mask[i]) {
+        img.data[i * 4] = maskColor[0];
+        img.data[i * 4 + 1] = maskColor[1];
+        img.data[i * 4 + 2] = maskColor[2];
+        img.data[i * 4 + 3] = 255;
+        continue;
+      }
       const g = Math.round(gray[i] * 255);
       img.data[i * 4] = g;
       img.data[i * 4 + 1] = g;
@@ -1158,7 +1333,7 @@
     }
   }
 
-  function drawTravel(canvas, T, w, h) {
+  function drawTravel(canvas, T, w, h, cutoff = Infinity) {
     resizeCanvas(canvas, w, h);
     const ctx = canvas.getContext("2d");
     const img = ctx.createImageData(w, h);
@@ -1170,9 +1345,17 @@
       if (v > hi) hi = v;
     }
     const span = Math.max(hi - lo, 1e-9);
-    // simple viridis-ish ramp
+    // simple viridis-ish ramp; excluded / unreached / not-yet-arrived → white
     for (let i = 0; i < w * h; i++) {
-      const t = Number.isFinite(T[i]) ? (T[i] - lo) / span : 0;
+      const v = T[i];
+      if (!Number.isFinite(v) || v > cutoff) {
+        img.data[i * 4] = 255;
+        img.data[i * 4 + 1] = 255;
+        img.data[i * 4 + 2] = 255;
+        img.data[i * 4 + 3] = 255;
+        continue;
+      }
+      const t = (v - lo) / span;
       const [r, g, b] = viridis(t);
       img.data[i * 4] = r;
       img.data[i * 4 + 1] = g;
@@ -1180,7 +1363,7 @@
       img.data[i * 4 + 3] = 255;
     }
     ctx.putImageData(img, 0, 0);
-    return { lo, hi };
+    return { lo: Number.isFinite(lo) ? lo : 0, hi: Number.isFinite(hi) ? hi : 0 };
   }
 
   function viridis(t) {
@@ -1202,7 +1385,19 @@
     ];
   }
 
-  function drawStripes(canvas, contours, w, h, lw, ghostGray) {
+  function strokePolys(ctx, polys) {
+    for (const poly of polys) {
+      if (poly.length < 2) continue;
+      ctx.beginPath();
+      ctx.moveTo(poly[0][1], poly[0][0]);
+      for (let i = 1; i < poly.length; i++) {
+        ctx.lineTo(poly[i][1], poly[i][0]);
+      }
+      ctx.stroke();
+    }
+  }
+
+  function drawStripes(canvas, contours, w, h, lw, ghostGray, frontPolys = null) {
     resizeCanvas(canvas, w, h);
     resizeCanvas(ghostCanvas, w, h);
     const ctx = canvas.getContext("2d");
@@ -1210,7 +1405,7 @@
 
     if (showGhost) {
       ghostCanvas.hidden = false;
-      drawGray(ghostCanvas, ghostGray, w, h, null);
+      drawGray(ghostCanvas, ghostGray, w, h, null, sourceMask, sourceMaskColor);
       // Leave stripe canvas transparent so the ghost shows through under the lines.
       ctx.clearRect(0, 0, w, h);
     } else {
@@ -1219,18 +1414,17 @@
       ctx.fillRect(0, 0, w, h);
     }
 
-    ctx.strokeStyle = "#111111";
     ctx.lineWidth = lw;
     ctx.lineJoin = "round";
     ctx.lineCap = "round";
-    for (const poly of contours) {
-      if (poly.length < 2) continue;
-      ctx.beginPath();
-      ctx.moveTo(poly[0][1], poly[0][0]);
-      for (let i = 1; i < poly.length; i++) {
-        ctx.lineTo(poly[i][1], poly[i][0]);
-      }
-      ctx.stroke();
+    ctx.strokeStyle = "#111111";
+    strokePolys(ctx, contours);
+
+    // Live wavefront: newest iso-level in accent
+    if (frontPolys && frontPolys.length) {
+      ctx.strokeStyle = "#1f8a70";
+      ctx.lineWidth = Math.max(lw * 1.6, lw + 0.35);
+      strokePolys(ctx, frontPolys);
     }
 
     heroStage.classList.remove("is-empty");
@@ -1255,13 +1449,91 @@
   }
 
   // ── Image ingest ───────────────────────────────────────────────────
-  function imageDataToGray(imgData) {
+  /**
+   * Detect B&W (+ near-gray) images that contain a single accent color used as an exclude mask.
+   * Full-color photos and pure grayscale return null.
+   * The mask may be any size (e.g. a solid background); what matters is that non-mask
+   * content is essentially grayscale and chromatic pixels share one dominant color.
+   */
+  function detectExcludeMask(imgData) {
+    const { data, width, height } = imgData;
+    const n = width * height;
+    const GRAY_CHROMA = 18; // max-min channel gap on 0–255
+    const COLOR_MATCH = 36; // RGB L1 distance to mode color
+    const MIN_MASK_FRAC = 0.002;
+    const MIN_CHROMA_FRAC = 0.0005;
+    const DOMINANCE = 0.72;
+    // Among pixels that are not the mask, nearly all should be near-gray.
+    const MIN_CONTENT_GRAY_FRAC = 0.9;
+
+    // Quantized RGB histogram for chromatic pixels (16 levels/channel)
+    const counts = new Int32Array(4096);
+    const rSum = new Float64Array(4096);
+    const gSum = new Float64Array(4096);
+    const bSum = new Float64Array(4096);
+    let chromaCount = 0;
+
+    for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      const chroma = Math.max(r, g, b) - Math.min(r, g, b);
+      if (chroma < GRAY_CHROMA) continue;
+      chromaCount++;
+      const key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+      counts[key]++;
+      rSum[key] += r;
+      gSum[key] += g;
+      bSum[key] += b;
+    }
+
+    if (chromaCount / n < MIN_CHROMA_FRAC) return null;
+
+    let bestKey = -1;
+    let bestCount = 0;
+    for (let k = 0; k < 4096; k++) {
+      if (counts[k] > bestCount) {
+        bestCount = counts[k];
+        bestKey = k;
+      }
+    }
+    if (bestKey < 0 || bestCount / chromaCount < DOMINANCE) return null;
+    if (bestCount / n < MIN_MASK_FRAC) return null;
+
+    const color = [
+      Math.round(rSum[bestKey] / bestCount),
+      Math.round(gSum[bestKey] / bestCount),
+      Math.round(bSum[bestKey] / bestCount),
+    ];
+
+    const mask = new Uint8Array(n);
+    let maskCount = 0;
+    let unmasked = 0;
+    let unmaskedChroma = 0;
+    for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      const chroma = Math.max(r, g, b) - Math.min(r, g, b);
+      const dist = Math.abs(r - color[0]) + Math.abs(g - color[1]) + Math.abs(b - color[2]);
+      if (chroma >= GRAY_CHROMA && dist <= COLOR_MATCH) {
+        mask[p] = 1;
+        maskCount++;
+      } else {
+        unmasked++;
+        if (chroma >= GRAY_CHROMA) unmaskedChroma++;
+      }
+    }
+    if (maskCount / n < MIN_MASK_FRAC) return null;
+    if (unmasked === 0) return null;
+    if (1 - unmaskedChroma / unmasked < MIN_CONTENT_GRAY_FRAC) return null;
+    return { mask, color, count: maskCount };
+  }
+
+  function imageDataToGrayAndMask(imgData) {
     const { data, width, height } = imgData;
     const gray = new Float32Array(width * height);
     for (let i = 0, p = 0; i < data.length; i += 4, p++) {
       gray[p] = (0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]) / 255;
     }
-    return { gray, width, height };
+    const maskInfo = detectExcludeMask(imgData);
+    return { gray, width, height, maskInfo };
   }
 
   function decodeImageElement(img) {
@@ -1279,7 +1551,7 @@
     c.height = h;
     const ctx = c.getContext("2d", { willReadFrequently: true });
     ctx.drawImage(img, 0, 0, w, h);
-    return imageDataToGray(ctx.getImageData(0, 0, w, h));
+    return imageDataToGrayAndMask(ctx.getImageData(0, 0, w, h));
   }
 
   function loadFile(file) {
@@ -1309,8 +1581,66 @@
   }
 
   // ── Pipeline ───────────────────────────────────────────────────────
+  function cancelLiveRender() {
+    liveToken++;
+  }
+
+  function easeOutCubic(t) {
+    return 1 - Math.pow(1 - t, 3);
+  }
+
+  /** Reveal contour levels in travel-time order; also sweeps the T field. */
+  function animateLiveReveal(levels, all, T, tr, w, h, lw, ghostGray, L) {
+    const token = liveToken;
+    const nLevels = Math.max(1, levels.length);
+    const duration = Math.min(5200, Math.max(1600, nLevels * 28));
+
+    // Prefer watching the lines grow
+    $("viewStripes").checked = true;
+    syncPanels();
+
+    return new Promise((resolve) => {
+      const t0 = performance.now();
+      let lastShown = -1;
+
+      function frame(now) {
+        if (token !== liveToken) {
+          resolve(false);
+          return;
+        }
+        const u = easeOutCubic(Math.min(1, (now - t0) / duration));
+        const shown = Math.min(nLevels, Math.max(1, Math.ceil(u * nLevels)));
+        if (shown !== lastShown || u >= 1) {
+          lastShown = shown;
+          const settled = [];
+          for (let i = 0; i < shown - 1; i++) settled.push(...levels[i]);
+          const front = levels[shown - 1] || [];
+          const visibleCount = settled.length + front.length;
+
+          if (u < 1) {
+            drawStripes(stripeCanvas, settled, w, h, lw, ghostGray, front);
+          } else {
+            drawStripes(stripeCanvas, all, w, h, lw, ghostGray, null);
+          }
+
+          const cutoff = tr.lo + u * Math.max(tr.hi - tr.lo, 1e-9);
+          drawTravel(tCanvas, T, w, h, u < 1 ? cutoff : Infinity);
+          $("metaStripes").textContent = `${u < 1 ? visibleCount : all.length} polylines · L=${L}`;
+          setStatus(`Live wave… ${Math.round(u * 100)}%`, true);
+        }
+        if (u >= 1) {
+          resolve(true);
+          return;
+        }
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+    });
+  }
+
   async function run() {
     if (!sourceGray || running) return;
+    cancelLiveRender();
     running = true;
     runBtn.disabled = true;
     downloadBtn.disabled = true;
@@ -1328,23 +1658,28 @@
       const mode = controls.seed.value;
       const nScatter = Number(controls.nScatter.value);
 
-      let img = normalize(sourceGray);
-      img = gaussianBlur(img, w, h, blurSigma);
-      img = normalize(img);
+      const mask = activeMask();
+
+      // Mask first, then blur/normalize only over drawable pixels.
+      let img = normalize(sourceGray, mask);
+      img = gaussianBlur(img, w, h, blurSigma, mask);
+      img = normalize(img, mask);
       lastDisplayGray = img;
 
       const intensity = new Float32Array(img.length);
       if (controls.invert.checked) {
-        for (let i = 0; i < img.length; i++) intensity[i] = 1 - img[i];
+        for (let i = 0; i < img.length; i++) intensity[i] = mask && mask[i] ? 0 : 1 - img[i];
       } else {
         intensity.set(img);
       }
 
       const speed = new Float32Array(intensity.length);
-      for (let i = 0; i < intensity.length; i++) speed[i] = eps + intensity[i];
+      for (let i = 0; i < intensity.length; i++) {
+        speed[i] = mask && mask[i] ? eps : eps + intensity[i];
+      }
 
-      const seeds = makeSeeds(h, w, mode, nScatter);
-      drawGray(inputCanvas, img, w, h, seeds);
+      const seeds = makeSeeds(h, w, mode, nScatter, mask);
+      drawGray(inputCanvas, img, w, h, seeds, sourceMask, sourceMaskColor);
       syncSeedFields();
 
       if (isCustomPoints() && seeds.length === 0) {
@@ -1358,14 +1693,22 @@
 
       // Yield once before heavy FMM
       await new Promise((r) => setTimeout(r, 0));
-      const T = travelTime(speed, w, h, seeds);
+      const T = travelTime(speed, w, h, seeds, mask);
 
       setStatus("Tracing contours…", true);
       await new Promise((r) => setTimeout(r, 0));
-      const contours = extractContours(T, w, h, L);
-
+      const { levels, all: contours } = extractContoursByLevel(T, w, h, L);
       const tr = drawTravel(tCanvas, T, w, h);
-      drawStripes(stripeCanvas, contours, w, h, lw, img);
+
+      if (controls.liveRender.checked && levels.length > 0) {
+        drawTravel(tCanvas, T, w, h, tr.lo);
+        drawStripes(stripeCanvas, [], w, h, lw, img, null);
+        const ok = await animateLiveReveal(levels, contours, T, tr, w, h, lw, img, L);
+        if (!ok) return; // superseded by a newer run
+      } else {
+        drawStripes(stripeCanvas, contours, w, h, lw, img);
+      }
+
       lastSVG = contoursToSVG(contours, w, h, lw);
 
       const modeLabel =
@@ -1374,7 +1717,8 @@
           : mode === "scatter"
             ? `points:${controls.pointSource.value}`
             : mode;
-      $("metaInput").textContent = `${w}×${h} · ${seeds.length} seeds · ${modeLabel}`;
+      const maskLabel = mask ? " · mask" : "";
+      $("metaInput").textContent = `${w}×${h} · ${seeds.length} seeds · ${modeLabel}${maskLabel}`;
       $("metaT").textContent = `T ∈ [${tr.lo.toFixed(1)}, ${tr.hi.toFixed(1)}]`;
       $("metaStripes").textContent = `${contours.length} polylines · L=${L}`;
 
@@ -1392,18 +1736,24 @@
 
   function scheduleRun() {
     if (!controls.autoRun.checked || !sourceGray) return;
+    cancelLiveRender(); // let an in-flight live sweep end so the next run can start
     clearTimeout(rerunTimer);
     rerunTimer = setTimeout(() => run(), 180);
   }
 
-  async function setSource(gray, width, height, url = null) {
+  async function setSource(gray, width, height, url = null, maskInfo = null) {
     sourceGray = gray;
     sourceW = width;
     sourceH = height;
     sourceUrl = url;
+    sourceMask = maskInfo ? maskInfo.mask : null;
+    sourceMaskColor = maskInfo ? maskInfo.color : null;
+    controls.useMask.checked = true;
+    syncMaskUI();
     setImageCredit(url ? exampleByUrl(url) : null);
     runBtn.disabled = false;
-    setStatus(`Loaded ${width}×${height}. Generating…`);
+    const maskNote = sourceMask ? " · exclude mask detected" : "";
+    setStatus(`Loaded ${width}×${height}${maskNote}. Generating…`);
     await run();
   }
 
@@ -1417,23 +1767,23 @@
     return example;
   }
 
-  async function loadExample() {
-    const example = pickExample();
+  async function loadExample(example = null) {
+    example = example || pickExample();
     setStatus(`Loading ${example.title}…`, true);
-    const { gray, width, height } = await loadImageUrl(example.url);
+    const { gray, width, height, maskInfo } = await loadImageUrl(example.url);
     lastExampleUrl = example.url;
-    await setSource(gray, width, height, example.url);
+    await setSource(gray, width, height, example.url, maskInfo);
   }
 
   async function reloadCurrentSource() {
     if (fileInput.files && fileInput.files[0]) {
-      const { gray, width, height } = await loadFile(fileInput.files[0]);
-      await setSource(gray, width, height, null);
+      const { gray, width, height, maskInfo } = await loadFile(fileInput.files[0]);
+      await setSource(gray, width, height, null, maskInfo);
       return;
     }
     if (sourceUrl) {
-      const { gray, width, height } = await loadImageUrl(sourceUrl);
-      await setSource(gray, width, height, sourceUrl);
+      const { gray, width, height, maskInfo } = await loadImageUrl(sourceUrl);
+      await setSource(gray, width, height, sourceUrl, maskInfo);
     }
   }
 
@@ -1443,8 +1793,8 @@
     if (!file) return;
     try {
       setStatus("Reading image…", true);
-      const { gray, width, height } = await loadFile(file);
-      await setSource(gray, width, height, null);
+      const { gray, width, height, maskInfo } = await loadFile(file);
+      await setSource(gray, width, height, null, maskInfo);
     } catch (e) {
       setStatus(e.message || "Load failed");
     }
@@ -1484,7 +1834,7 @@
     customSeedsFrac = [];
     syncSeedFields();
     if (lastDisplayGray && sourceW && sourceH) {
-      drawGray(inputCanvas, lastDisplayGray, sourceW, sourceH, []);
+      drawGray(inputCanvas, lastDisplayGray, sourceW, sourceH, [], sourceMask, sourceMaskColor);
     }
     scheduleRun();
     if (!controls.autoRun.checked) run();
@@ -1497,11 +1847,19 @@
     const fx = (e.clientX - rect.left) / rect.width;
     const fy = (e.clientY - rect.top) / rect.height;
     if (fx < 0 || fx > 1 || fy < 0 || fy > 1) return;
+    const py = Math.min(sourceH - 1, Math.max(0, Math.round(fy * (sourceH - 1))));
+    const px = Math.min(sourceW - 1, Math.max(0, Math.round(fx * (sourceW - 1))));
+    if (activeMask() && sourceMask[py * sourceW + px]) {
+      setStatus("That pixel is masked — click an unmasked region");
+      return;
+    }
     customSeedsFrac.push([fy, fx]);
     syncSeedFields();
-    const seeds = fracToPixelSeeds(sourceH, sourceW);
+    const seeds = fracToPixelSeeds(sourceH, sourceW).filter(
+      ([y, x]) => !isMaskedAt(activeMask(), y, x, sourceW)
+    );
     if (lastDisplayGray) {
-      drawGray(inputCanvas, lastDisplayGray, sourceW, sourceH, seeds);
+      drawGray(inputCanvas, lastDisplayGray, sourceW, sourceH, seeds, sourceMask, sourceMaskColor);
     }
     setStatus(`Seed ${customSeedsFrac.length} placed — solving…`);
     scheduleRun();
@@ -1550,8 +1908,8 @@
     if (!file || !file.type.startsWith("image/")) return;
     try {
       setStatus("Reading image…", true);
-      const { gray, width, height } = await loadFile(file);
-      await setSource(gray, width, height, null);
+      const { gray, width, height, maskInfo } = await loadFile(file);
+      await setSource(gray, width, height, null, maskInfo);
     } catch (err) {
       setStatus(err.message || "Load failed");
     }
@@ -1559,9 +1917,11 @@
 
   syncLabels();
 
-  // Default sample from /examples (needs HTTP — works on GitHub Pages / local server)
+  // Default to Einstein on refresh; "Load Example" still picks at random.
   requestAnimationFrame(() => {
-    loadExample().catch((e) => setStatus(e.message || "Load failed"));
+    const defaultExample =
+      EXAMPLE_IMAGES.find((ex) => ex.url === "examples/einstein.jpg") || EXAMPLE_IMAGES[0];
+    loadExample(defaultExample).catch((e) => setStatus(e.message || "Load failed"));
   });
 })();
   </script>
