@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>TopoLines — topographic image lines</title>
+  <title>TopoLines</title>
   <meta name="description" content="Turn a photo into topographic contour lines via the eikonal equation. Runs entirely in your browser." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -458,7 +458,7 @@
     <header class="hero-top">
       <h1 class="brand"><span>TopoLines</span></h1>
       <p class="lede">
-        Turn a photo into topographic contour lines — wavefronts from the eikonal equation, shaded by line spacing.
+        Turn a photo into contour lines using the eikonal equation. 
       </p>
     </header>
 
@@ -529,8 +529,8 @@
           <input id="L" type="range" min="1" max="40" step="0.5" value="8" />
         </div>
         <div class="field">
-          <label>Line width <b id="vLw">0.35</b></label>
-          <input id="lw" type="range" min="0.1" max="2" step="0.05" value="0.35" />
+          <label>Line width <b id="vLw">1</b></label>
+          <input id="lw" type="range" min="0.1" max="2" step="0.05" value="1" />
         </div>
         <div class="field">
           <label>Max side (px) <b id="vMax">512</b></label>
@@ -595,8 +595,8 @@
     </section>
 
     <footer class="note">
-      TopoLines turns images into topographic contour lines via the eikonal equation —
-      <a href="https://github.com/tomunderwood99/TopoLines">source on GitHub</a>.
+      Explanations for how this works and more ways to use it can be found on
+      <a href="https://github.com/tomunderwood99/TopoLines">GitHub</a>.
     </footer>
   </div>
 

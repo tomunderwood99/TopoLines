@@ -23,6 +23,14 @@ at the seed points, the wave moves outward across the image (our puddle). Dim ar
 the wave to move rapidly, while bright areas slow it down. The shape of the wave is recorded on a regular interval
 until it fully fills the image. The combination of all these shapes creates a unique rendering of the original image.
 
+<p align="center">
+  <img src="examples/einstein_wave.gif" width="360" alt="Wave-front propagation on Einstein"/>
+</p>
+
 ## Masking Functionality
 Playing with negative space is a fun addition to these images. To add a mask, edit your image to be
 grayscale, and add a monocolored layer over regions you want to exclude. The site will automatically register this layer as a mask.
+
+| Masked input | TopoLines |
+|:---:|:---:|
+| <img src="examples/einstein_masked.png" width="300"/> | <img src="examples/einstein_masked.svg" width="300"/> |
